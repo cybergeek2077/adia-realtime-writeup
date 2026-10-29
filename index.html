@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<meta name="description" content="The ADIA Lab real-time structural-break challenge write-up by cybergeek, in English and Chinese.">
+<meta name="author" content="cybergeek">
+<title>Calibrate, Then Accumulate: Real-Time Structural Break Detection | cybergeek</title>
+<link rel="canonical" href="https://cybergeek2077.github.io/adia-realtime-writeup/">
+<link rel="alternate" hreflang="en" href="https://cybergeek2077.github.io/adia-realtime-writeup/">
+<link rel="alternate" hreflang="zh-CN" href="https://cybergeek2077.github.io/adia-realtime-writeup/zh.html">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<a class="skip" href="#article">Skip to article</a>
+<header class="site-header"><div class="header-inner">
+<a class="brand" href="index.html">cybergeek · Write-up</a>
+<nav aria-label="Language and downloads">
+<a href="index.html" lang="en" hreflang="en" aria-current="page">English</a>
+<a href="zh.html" lang="zh-CN" hreflang="zh-CN">中文</a>
+<a class="download" href="cybergeek_ADIA_RealTime_Writeup.pdf">English PDF</a>
+</nav></div></header>
+<div class="layout">
+<aside aria-label="Contents"><h2>Contents</h2><ul class="toc"><li><a href="#section-1">Abstract</a></li><li><a href="#section-2">1. The task and the evaluation target</a></li><li><a href="#section-3">2. Start with a normal reference for each series</a></li><li><a href="#section-4">3. Tree ensembles: vary the training task, not just the seed</a></li><li><a href="#section-5">4. A complementary neural view</a></li><li><a href="#section-6">5. What the final 53-model submission actually computes</a></li><li><a href="#section-7">6. Results: separate public, private and local evidence</a></li><li><a href="#section-8">7. Public-label and data-use disclosure</a></li><li><a href="#section-9">8. What helped, and what we would do differently</a></li><li><a href="#section-10">9. Engineering, causality and reproducibility</a></li><li><a href="#section-11">Conclusion</a></li><li><a href="#section-12">References and scope</a></li></ul></aside>
+<main>
+<details class="mobile-toc"><summary>Contents</summary><ul class="toc"><li><a href="#section-1">Abstract</a></li><li><a href="#section-2">1. The task and the evaluation target</a></li><li><a href="#section-3">2. Start with a normal reference for each series</a></li><li><a href="#section-4">3. Tree ensembles: vary the training task, not just the seed</a></li><li><a href="#section-5">4. A complementary neural view</a></li><li><a href="#section-6">5. What the final 53-model submission actually computes</a></li><li><a href="#section-7">6. Results: separate public, private and local evidence</a></li><li><a href="#section-8">7. Public-label and data-use disclosure</a></li><li><a href="#section-9">8. What helped, and what we would do differently</a></li><li><a href="#section-10">9. Engineering, causality and reproducibility</a></li><li><a href="#section-11">Conclusion</a></li><li><a href="#section-12">References and scope</a></li></ul></details>
+<article id="article"><h1>Calibrate, Then Accumulate</h1>
+<h2 class="subtitle">A 39th-place solution to the ADIA Lab Structural Break Challenge: Real-Time Edition</h2>
+<p><strong>cybergeek</strong><br />
+Independent developer and researcher<br />
+Model: <code>worthwhile-raven</code> · Final submission: 30 · October 2026</p>
+<h2 id="section-1">Abstract</h2>
+<p>Our solution combines a history-calibrated statistical representation with gradient-boosted trees and small causal neural models. For each series, we fit a model of normal behaviour to its provided history, transform incoming observations into several residual streams, and compute multiscale change statistics. Trees trained on different augmentation distributions supply the main detector. A causal patch TCN and a neural Shiryaev–Roberts-style accumulator provide complementary temporal evidence; a small collection of fixed blends and difference corrections completes the submitted ensemble.</p>
+<p>The selected submission scored <strong>65.34% public TS-AUC</strong> and <strong>65.2271% private TS-AUC</strong>, placing <strong>39th in the official team-aware ranking</strong>. The public score is not entirely out of sample: the final training recipe includes the 100 labelled reduced-test series supplied by the organisers, which also belong to the public leaderboard. Their contribution to the full public score has not been isolated. We do not interpret the public improvement from adding them as evidence of private-test improvement.</p>
+<p>The main lesson was not that a larger ensemble always helps. Most of our progress came from making heterogeneous series comparable, improving training coverage, and combining genuinely complementary scoring functions. Late, small refinements were much harder to validate than their apparent complexity might suggest.</p>
+<h2 id="section-2">1. The task and the evaluation target</h2>
+<p>Each example contains a historical segment known to precede any labelled break, followed by an online segment revealed one observation at a time. At online step <code>t</code>, the output is a score for the event <strong>“a structural break has already occurred by t”</strong>. The break location is unknown. This is not the earlier competition's task of classifying a supplied boundary using an entire post-boundary segment.</p>
+<p>The provided training population contains 10,000 series and 5,036,517 online observations. In the inspected training data, histories contain approximately 1,000–5,000 points and online segments 10–999 points. About half the series have a break. Each online prefix must be processed without inspecting future values, the eventual online length, or other test series.</p>
+<p>TS-AUC measures ranking <strong>across series at the same online step</strong>, not an AUC computed independently inside each series. If <code>P_t</code> and <code>N_t</code> are the positive and negative counts at step <code>t</code>, the metric is:</p>
+<pre><code class="language-text">TS-AUC = sum_t P_t * N_t * AUC_t / sum_t P_t * N_t
+</code></pre>
+<p>Ties receive half credit. Consequently, neither next-point forecasting loss, a stopping-time objective, nor ordinary pooled row-wise AUC is an adequate substitute. We used exact per-step, pair-count-weighted evaluation and checked key results against an independent sklearn implementation.</p>
+<h2 id="section-3">2. Start with a normal reference for each series</h2>
+<p>The training series are heterogeneous. A level, a variance, or an autocorrelation value that is unusual for one process can be ordinary for another. Our representation therefore asks: <strong>how does the observed prefix differ from this series' own historical behaviour?</strong></p>
+<h3>2.1 Three history-calibrated residual streams</h3>
+<p>For the main representation, an autoregression with an intercept and order up to 12 is fitted on the history, with BIC selecting the order. Its coefficients and historical innovation scale are then fixed during online inference. Let <code>e_t</code> be the innovation obtained by applying that predictor to the new observation and already-seen lags.</p>
+<p>We construct:</p>
+<ul>
+<li><strong>z:</strong> the AR innovation divided by its historical scale;</li>
+<li><strong>n:</strong> the historical empirical probability-integral transform of the innovation, followed by a standard-normal quantile transform;</li>
+<li><strong>g:</strong> the innovation additionally standardised by a causal EWMA variance estimate, with the smoothing choice fitted from the history.</li>
+</ul>
+<p>Only the <code>n</code> stream is explicitly normal-score transformed. Standardising <code>z</code> or <code>g</code> does <strong>not</strong> guarantee that either is Gaussian, independent, or perfectly calibrated under the null.</p>
+<p>A second whitening view uses longer AR candidates, with <strong>AICc-weighted coefficient averaging</strong> rather than a single long-order selection. This view is used by the longAR tree group. The BIC and longAR feature matrices must not be interchanged at inference.</p>
+<h3>2.2 Multiscale evidence, not a single alarm statistic</h3>
+<p>Across the three streams we use 26 channels: level, square, absolute value, sign, tail indicators, lag products up to lag 8, and ARCH-like dependence features. For each channel, a current window average is compared with the historical channel mean and scaled by its historical standard deviation and the square root of the available window size.</p>
+<p>The time scales are 15 approximately square-root-of-two-spaced finite windows:</p>
+<pre><code class="language-text">5, 7, 10, 14, 20, 28, 40, 57, 80, 113, 160, 226, 320, 453, 640
+</code></pre>
+<p>A sixteenth window covers everything observed since the online segment began. Scan summaries include maxima, the maximising scale, positive/negative CUSUMs and a Bayes-inspired aggregation across scales. Historical process descriptors and the known current time are also supplied. The resulting 583 base features are expanded by 180 derived interactions to <strong>763 columns</strong>.</p>
+<p>These are z-style evidence features, not calibrated hypothesis-test p-values. Their usefulness comes from a learned combination of many imperfect views of change, rather than a claim that one hand-written detector captures every break type.</p>
+<h2 id="section-4">3. Tree ensembles: vary the training task, not just the seed</h2>
+<p>The main tree score averages four LightGBM groups, each with three seeds:</p>
+<div class="table-scroll" role="region" tabindex="0" aria-label="Scrollable data table"><table>
+<thead>
+<tr>
+  <th>Group</th>
+  <th>Distinguishing training/representation choice</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>sim4</td>
+  <td>Additional simulated-break examples</td>
+</tr>
+<tr>
+  <td>shift</td>
+  <td>Move a tail of the positive series' history into the online segment to create an earlier monitoring start</td>
+</tr>
+<tr>
+  <td>advance</td>
+  <td>Move an initial online prefix into the history and shift the remaining break location</td>
+</tr>
+<tr>
+  <td>longAR</td>
+  <td>Longer, AICc-averaged historical whitening</td>
+</tr>
+</tbody>
+</table></div>
+<p>All groups retain real training observations. The important diversity is the training distribution and whitening view, not simply a collection of independent seeds of one dataset.</p>
+<h3>3.1 Cover all real online steps while controlling their loss mass</h3>
+<p>An effective change was to use every real online step rather than a sparse selection. However, giving all those rows unit weight would also change the balance between real and augmented data. We retained the original effective mass by assigning real rows weight approximately <strong>0.14994</strong>, while ordinary augmented rows have weight 1. Transplant-side training uses three donor examples with weight 1/3 each rather than tripling that augmentation's mass.</p>
+<p>This separates two interventions that are otherwise easy to confuse: increasing coverage and changing source weights. It controls relative source loss mass, not within-series dependence; validation must therefore remain grouped by parent series.</p>
+<p>The final base boosters use conservative settings, including learning rate 0.02, 31 leaves, large minimum leaf support and L2 regularisation. Most have 400 boosting rounds. Two sim4 seeds use 1,200 rounds; the third retains 400.</p>
+<h3>3.2 Real-change transplants as side models</h3>
+<p>We also trained six side boosters: three each for the shift and longAR groups. They use real post-break donor material transplanted into other series, rather than relying exclusively on parametric simulated breaks. The final side boosters have 1,200 rounds.</p>
+<p>At inference, each affected group is a <strong>25% original / 75% transplant-side blend</strong>. The four group scores are then averaged equally. The placement matters: making a donor-trained model stronger in isolation did not necessarily improve an ensemble when it replaced or homogenised several existing members.</p>
+<p>For cross-validation, augmentations and donor construction must follow the training parents of the outer fold. Generating augmented data from the full population before splitting would invalidate the comparison.</p>
+<h2 id="section-5">4. A complementary neural view</h2>
+<p>The neural members see history-standardised raw values together with the <code>z</code>, <code>n</code> and <code>g</code> streams. They use causal patch representations and running statistics; they are not unrelated pretrained foundation models.</p>
+<h3>4.1 Causal patch TCN</h3>
+<p>The TCN compares the current, partially observed patch with historical and earlier online patch representations, together with explicit streaming statistics. A point in an unfinished patch must not be represented using the later points in that patch.</p>
+<p>The submitted TCN averages two seeds. Training uses real examples plus start-advance augmentation, history-patch sampling, sign reflection, and pair-weighted logistic supervision at sampled online anchor times. The standard recipe uses 60 epochs and AdamW with a warm-up/cosine learning-rate schedule.</p>
+<p>Its value was complementarity. A neural member did not need to beat the tree ensemble alone to improve the combined ranking. In the historical comparison, start-advance training reduced the pooled OOF logit correlation with the tree baseline from about 0.920 to 0.854.</p>
+<h3>4.2 Neural evidence accumulation</h3>
+<p>A second member learns per-point evidence increments and accumulates them in log space:</p>
+<pre><code class="language-text">r_t = softplus(r_(t-1)) + increment_t
+score_t = sigmoid(r_t + bias + training_time_prior_t)
+</code></pre>
+<p>Initialise <code>R_0 = 0</code> (equivalently, <code>r_0 = −∞</code>), so the first update is <code>r_1 = increment_1</code>.</p>
+<p>Equivalently, before the final readout, this has the Shiryaev–Roberts form <code>R_t = (1 + R_(t-1)) * exp(increment_t)</code>, collecting support over possible starts. The increments are learned discriminatively. We do <strong>not</strong> claim that they are true calibrated log-likelihood ratios, or that the final ensemble is an exact Bayesian posterior.</p>
+<p>The final CUSUM-style member averages eight seeds. It uses real examples, two start-advance copies and shift augmentation. An early/late hand-over combines the two neural families:</p>
+<pre><code class="language-text">alpha_t = clip((t - 32) / 96, 0, 1)
+N_t     = (1 - alpha_t) * TCN2_t + alpha_t * CUSUM8_t
+B_t     = 0.70 * Tree_t + 0.30 * N_t
+</code></pre>
+<p>The ramp is zero through step 32 and one from step 128 onward. It lets direct patch evidence dominate early and accumulated evidence dominate later.</p>
+<h2 id="section-6">5. What the final 53-model submission actually computes</h2>
+<p>The remainder of the final solution consists of small blends and difference corrections. It should not be represented as 53 models all averaged with equal weights.</p>
+<div class="table-scroll" role="region" tabindex="0" aria-label="Scrollable data table"><table>
+<thead>
+<tr>
+  <th>Component</th>
+  <th style="text-align:right">Fitted models</th>
+  <th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>Four base tree groups</td>
+  <td style="text-align:right">12</td>
+  <td>Main multiscale detector</td>
+</tr>
+<tr>
+  <td>Transplant side boosters</td>
+  <td style="text-align:right">6</td>
+  <td>Within-group side blends</td>
+</tr>
+<tr>
+  <td>Causal TCN</td>
+  <td style="text-align:right">2</td>
+  <td>Early neural evidence</td>
+</tr>
+<tr>
+  <td>Neural CUSUM</td>
+  <td style="text-align:right">8</td>
+  <td>Accumulated neural evidence</td>
+</tr>
+<tr>
+  <td>Reset evidence networks</td>
+  <td style="text-align:right">2</td>
+  <td>Complementary probability blend</td>
+</tr>
+<tr>
+  <td>Prefix correction</td>
+  <td style="text-align:right">1</td>
+  <td>History-routed replacement difference</td>
+</tr>
+<tr>
+  <td>Paired comparator</td>
+  <td style="text-align:right">2</td>
+  <td>Small two-segment comparison blend</td>
+</tr>
+<tr>
+  <td>Signature and moments models</td>
+  <td style="text-align:right">4</td>
+  <td>Matched prediction difference</td>
+</tr>
+<tr>
+  <td>Direction models and priors</td>
+  <td style="text-align:right">16</td>
+  <td>History-informed direction difference</td>
+</tr>
+<tr>
+  <td><strong>Total</strong></td>
+  <td style="text-align:right"><strong>53</strong></td>
+  <td><strong>38 tree boosters and 15 neural models</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p>The Reset member uses a GRU-style gated transformation whose hidden state is reset to a history-derived state at every online step. Temporal information still enters through running statistics and evidence accumulation; it is not a detector with no memory of the prefix.</p>
+<p>The prefix model adds a small difference relative to one Reset seed. It reads full-prefix evidence with an age-grid readout, not a separate suffix model for every candidate start. Its weight is higher for steps 257–512. A history-only predictability measure, <code>abs(log(sigma_AR / std(history)))</code>, routes the correction with multiplier 1.5 below 0.0137378481 and 0.5 otherwise.</p>
+<p>The comparator supplies another two-segment view. The signature term is the difference between path-signature and matched moments models, rather than an unqualified claim that signatures alone are superior. Direction priors estimated from history modulate signed change evidence; a matched base prediction is subtracted before applying the correction.</p>
+<p>Writing <code>clip</code> for clipping to <code>[0,1]</code>, the final order is:</p>
+<pre><code class="language-text">B = 0.70 * Tree + 0.30 * Neural
+U = clip(0.90 * B + 0.10 * Reset2
+         + route(H) * w_t * (Prefix - Reset937))
+V = clip(0.95 * U + 0.05 * Comparator2
+         + 0.05 * (Signature2 - Moments2))
+S = clip(V + 0.1108333333 * mean(Direction - MatchedBase))
+</code></pre>
+<p>The signature difference starts at step 32. <code>w_t</code> is 0.15 at steps 257–512 and 0.05 otherwise. Clipping occurs after the prefix, comparator/signature and direction stages—not separately after every individual operation.</p>
+<p>These additions explain the final implementation, but their presence does not mean each has equally strong independent evidence. Several late refinements were small and affected by repeated development on the same data.</p>
+<h2 id="section-7">6. Results: separate public, private and local evidence</h2>
+<h3>6.1 Selected submission</h3>
+<div class="table-scroll" role="region" tabindex="0" aria-label="Scrollable data table"><table>
+<thead>
+<tr>
+  <th>Evaluation</th>
+  <th style="text-align:right">TS-AUC</th>
+  <th>Interpretation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>Selected submission, public</td>
+  <td style="text-align:right"><strong>65.34%</strong></td>
+  <td>Includes a labelled-public-series training component</td>
+</tr>
+<tr>
+  <td>Selected submission, private</td>
+  <td style="text-align:right"><strong>65.2271%</strong></td>
+  <td>Official final out-of-sample result</td>
+</tr>
+<tr>
+  <td>Official final ranking</td>
+  <td style="text-align:right"><strong>39th</strong></td>
+  <td>Team-aware ranking</td>
+</tr>
+</tbody>
+</table></div>
+<p>The public-to-private change is about −0.11 percentage points. Because these are different test populations, we cannot attribute that difference exclusively to training on the 100 public series.</p>
+<h3>6.2 Development milestones</h3>
+<p>The following are public leaderboard readings, not a common-protocol ablation table. A later row may contain several changes and the intervening development was not monotonic.</p>
+<div class="table-scroll" role="region" tabindex="0" aria-label="Scrollable data table"><table>
+<thead>
+<tr>
+  <th>Submission</th>
+  <th>Main stage reached</th>
+  <th style="text-align:right">Public TS-AUC</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>1</td>
+  <td>History-calibrated residual statistics and LightGBM</td>
+  <td style="text-align:right">63.00%</td>
+</tr>
+<tr>
+  <td>2</td>
+  <td>Finer window grid, interactions and seed averaging</td>
+  <td style="text-align:right">63.48%</td>
+</tr>
+<tr>
+  <td>9</td>
+  <td>Full real-step coverage with controlled loss mass</td>
+  <td style="text-align:right">63.99%</td>
+</tr>
+<tr>
+  <td>11</td>
+  <td>Causal TCN with start-advance training</td>
+  <td style="text-align:right">64.53%</td>
+</tr>
+<tr>
+  <td>13</td>
+  <td>Neural accumulation and revised core blend</td>
+  <td style="text-align:right">64.66%</td>
+</tr>
+<tr>
+  <td>17</td>
+  <td>Reset/prefix additions and transplant side models</td>
+  <td style="text-align:right">65.01%</td>
+</tr>
+<tr>
+  <td>25</td>
+  <td>Later corrections, more CUSUM seeds and longer side boosters</td>
+  <td style="text-align:right">65.23%</td>
+</tr>
+<tr>
+  <td>30</td>
+  <td>Retains submission 28's public100 refit; repairs training orchestration</td>
+  <td style="text-align:right">65.34%</td>
+</tr>
+</tbody>
+</table></div>
+<p>The early EWMA z-score baseline scored about 51.45% on the provided training population, without learned parameters. This is a local baseline reading, not a public score to subtract from 63.00% as a controlled public improvement.</p>
+<h2 id="section-8">7. Public-label and data-use disclosure</h2>
+<p>The organisers supplied 100 labelled reduced-test series, confirmed to belong to the public leaderboard and not the private test set. Three advance boosters had already used these as ordinary training examples; the final refit included them across the remaining model families. In total, 50 fitted model files were retrained and three advance files retained, with the history-routing threshold recomputed.</p>
+<p>This can raise the public score through an in-sample component. We did not isolate its contribution to the complete public metric, so we do not count that gain as generalisation evidence.</p>
+<p>A separate research probe, submission 16, explicitly used the known public labels and reached about 65.70% publicly. <strong>It was not selected for final evaluation and is not the final model described here.</strong> The selected model uses the public series as training inputs, not a label-lookup rule at inference.</p>
+<p>The final reconstruction recipe uses the official training files and the labelled reduced-test files. It does not include hidden test series as training inputs or externally pretrained time-series weights. The submitted repaired package does not bundle the competition datasets.</p>
+<p>We did not add an explicit float-grid artifact detector or artifact-specific decision rule. This is not a claim that learned models are automatically insensitive to every data-generation artifact, or that we have quantified artifacts' effect on the final ranking.</p>
+<h2 id="section-9">8. What helped, and what we would do differently</h2>
+<p><strong>History calibration was foundational.</strong> It made a heterogeneous population amenable to shared learning. Explicit multiscale features were more useful than relying on a global anomaly threshold.</p>
+<p><strong>Training distribution mattered as much as model family.</strong> Shifted starts, simulated breaks and donor transplants gave the same learner different errors. More samples or a stronger individual model did not guarantee a stronger ensemble.</p>
+<p><strong>Complementarity had to be measured in the full recipe.</strong> Direct TCN scoring, accumulated neural evidence and the Reset member could help despite imperfect standalone scores. Low correlation alone was not sufficient: weak alternatives often still hurt.</p>
+<p><strong>Normal prediction quality and break detection are different objectives.</strong> In one controlled conditional-density experiment, normal next-point NLL improved by roughly 0.019–0.023 nat, but a fixed-window NLL detector failed to add useful break information. That is a negative result for that construction, not an upper bound on learned likelihood-based detection.</p>
+<p><strong>Late refinement had diminishing practical returns.</strong> Tested configurations of larger/alternative neural models, external time-series pretraining, distillation, learned stacking, additional statistical feature families and specialist routing often failed to deliver reliable gains over the ensemble of the time. We would not generalise those results to entire method families.</p>
+<p>In retrospect, we would establish a verified probabilistic baseline earlier, preserve all OOF predictions separately from disposable caches, and spend less effort on many small corrections before securing cleaner confirmation. AI-assisted implementation accelerated the research, but also made explicit protocol checks, independent scoring and careful interpretation essential.</p>
+<h2 id="section-10">9. Engineering, causality and reproducibility</h2>
+<p>Inference is CPU-based and requires NumPy, SciPy and LightGBM, with an optional compiled C++ signature backend and a NumPy fallback. PyTorch is used for training, not required for the final pretrained inference path. Each series has its own inference state; no test-data adaptation across series or batch-level rank normalisation is part of the submitted recipe.</p>
+<p>The selected cloud run completed on CPU in approximately <strong>2 h 31 min</strong>. The official local determinism check passed at <strong>1e−8 on the pretrained path</strong>; we also performed raw-input replay and prefix/ordering checks. This is not a claim of bitwise-identical retraining across GPUs, library versions or machines.</p>
+<p>Submission 30 retains submission 28's fitted weights, ensemble configuration and inference code. The engineering repair changed training orchestration, input resolution and provenance, while removing bundled competition data. A low-budget raw-input smoke reconstruction exercised all model families. A full-budget, end-to-end scratch retraining of the repaired package was <strong>not</strong> repeated as part of that repair; we distinguish that limitation from unchanged pretrained inference.</p>
+<p>This document describes the submitted recipe and its evidence. It does not redistribute the competition data or claim that source code or weights have already been publicly released.</p>
+<h2 id="section-11">Conclusion</h2>
+<p>The useful abstraction was <strong>calibrated evidence about change</strong>, not a universal anomaly score. Historical modelling, multiple time scales, diverse training tasks and learned accumulation together produced a competitive causal detector. The final private result was 65.2271% TS-AUC and 39th place.</p>
+<p>The weaker part of the process was inference about research progress: public-score improvements, local component gains and complete-ensemble generalisation were sometimes too easy to conflate. A successful write-up should preserve those distinctions as carefully as the implementation preserves causality.</p>
+<h2 id="section-12">References and scope</h2>
+<ul>
+<li><a href="https://docs.crunchdao.com/competitions/competitions/structural-break-real-time">Official Real-Time Edition task and evaluation documentation</a></li>
+<li><a href="https://hub.crunchdao.com/competitions/structural-break-real-time/leaderboard?crunchId=458">Official out-of-sample leaderboard</a></li>
+<li><a href="https://www.adialab.ae/adia-lab-x-crunch-the-structural-break-challenge-2026">ADIA Lab competition page</a></li>
+<li><a href="https://docs.crunchdao.com/competitions/competitions#write-up">CrunchDAO guidance on write-ups</a></li>
+</ul>
+<p>Numerical milestones describe the historical experiments indicated, not interchangeable estimates of one model.</p>
+</article>
+</main></div>
+<footer class="site-footer"><span>cybergeek · Independent developer and researcher</span>
+<span>ADIA Lab Structural Break Challenge · Real-Time Edition</span></footer>
+</body></html>

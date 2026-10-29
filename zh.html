@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<meta name="description" content="cybergeek 的 ADIA Lab 实时结构断点挑战赛方案复盘，中英文双语。">
+<meta name="author" content="cybergeek">
+<title>先校准，再累积：实时结构断点检测方案 | cybergeek</title>
+<link rel="canonical" href="https://cybergeek2077.github.io/adia-realtime-writeup/zh.html">
+<link rel="alternate" hreflang="en" href="https://cybergeek2077.github.io/adia-realtime-writeup/">
+<link rel="alternate" hreflang="zh-CN" href="https://cybergeek2077.github.io/adia-realtime-writeup/zh.html">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<a class="skip" href="#article">跳到正文</a>
+<header class="site-header"><div class="header-inner">
+<a class="brand" href="index.html">cybergeek · Write-up</a>
+<nav aria-label="语言与下载">
+<a href="index.html" lang="en" hreflang="en">English</a>
+<a href="zh.html" lang="zh-CN" hreflang="zh-CN" aria-current="page">中文</a>
+<a class="download" href="cybergeek_ADIA_RealTime_Writeup.pdf">英文 PDF</a>
+</nav></div></header>
+<div class="layout">
+<aside aria-label="目录"><h2>目录</h2><ul class="toc"><li><a href="#section-1">摘要</a></li><li><a href="#section-2">1. 问题和真正需要优化的指标</a></li><li><a href="#section-3">2. 以每条序列自己的历史建立正常参照</a></li><li><a href="#section-4">3. 树集成：改变训练任务，而不只是增加种子</a></li><li><a href="#section-5">4. 神经成员：同样的信息，不同的函数与累计方式</a></li><li><a href="#section-6">5. 终版53模型不是简单平均</a></li><li><a href="#section-7">6. 结果：公榜、私榜、本地不能混用</a></li><li><a href="#section-8">7. 公开标签与数据使用披露</a></li><li><a href="#section-9">8. 有效经验、负结果与反思</a></li><li><a href="#section-10">9. 工程、因果性与可复现边界</a></li><li><a href="#section-11">结语</a></li><li><a href="#section-12">参考资料</a></li></ul></aside>
+<main>
+<details class="mobile-toc"><summary>目录</summary><ul class="toc"><li><a href="#section-1">摘要</a></li><li><a href="#section-2">1. 问题和真正需要优化的指标</a></li><li><a href="#section-3">2. 以每条序列自己的历史建立正常参照</a></li><li><a href="#section-4">3. 树集成：改变训练任务，而不只是增加种子</a></li><li><a href="#section-5">4. 神经成员：同样的信息，不同的函数与累计方式</a></li><li><a href="#section-6">5. 终版53模型不是简单平均</a></li><li><a href="#section-7">6. 结果：公榜、私榜、本地不能混用</a></li><li><a href="#section-8">7. 公开标签与数据使用披露</a></li><li><a href="#section-9">8. 有效经验、负结果与反思</a></li><li><a href="#section-10">9. 工程、因果性与可复现边界</a></li><li><a href="#section-11">结语</a></li><li><a href="#section-12">参考资料</a></li></ul></details>
+<article id="article"><h1>先校准，再累积</h1>
+<h2 class="subtitle">ADIA Lab Structural Break Challenge: Real-Time Edition 第39名方案复盘</h2>
+<p><strong>cybergeek</strong><br />
+独立开发者与研究者 / Independent developer and researcher<br />
+模型：<code>worthwhile-raven</code> · 最终提交：#30 · 2026年10月</p>
+<blockquote>
+<p>本文是英文发布稿的中文对照，仅描述实际参赛方案、赛中实验和最终公私榜结果。</p>
+</blockquote>
+<h2 id="section-1">摘要</h2>
+<p>我们的方案将“以各序列自身历史为参照的统计表示”与梯度提升树、小型因果神经模型结合。每条序列先用历史段建立正常模型，再将新到来的点变成多条残差流，计算多尺度变化统计。不同增强来源训练的树组构成主体；因果patch-TCN与神经证据累积提供互补；最后用少量固定混合与差分修正形成提交。</p>
+<p>选中的终版公榜为 <strong>65.34% TS-AUC</strong>，私榜为 <strong>65.2271%</strong>，官方按团队去重排名 <strong>第39名</strong>。必须提前说明：终版训练使用了官方发布且属于公榜的100条带标签reduced-test序列，所以公榜分数含样本内成分，不能全部视为泛化表现。这部分对完整公榜的贡献未被单独隔离，也不能据此声称私榜会提高。</p>
+<p>最大的经验不是“模型越多越好”，而是先让异质序列变得可比较，再扩大有效训练覆盖、组合错误不同的判据。后期许多小修正的验证难度，远大于其表面实现难度。</p>
+<h2 id="section-2">1. 问题和真正需要优化的指标</h2>
+<p>每个样本包含一段已知处于标注断点之前的历史H，以及逐点到来的在线段。在线第t步需要输出“<strong>截至现在是否已发生断点</strong>”的评分。断点位置未知，不能读取未来、最终在线长度或其他测试序列。</p>
+<p>这与上一届“给定边界、读取完整前后两段再判断”的任务不同，也不只是预测下一个点是否异常。</p>
+<p>官方训练集有10,000条序列、5,036,517个在线时刻；在我们检查的数据中，历史长度约1,000–5,000，在线段长度10–999，约半数序列发生断点。</p>
+<p>TS-AUC在<strong>同一个t上跨序列比较排序</strong>，然后按正负配对数加权：</p>
+<pre><code class="language-text">TS-AUC = sum_t P_t * N_t * AUC_t / sum_t P_t * N_t
+</code></pre>
+<p>并列计半分。因此普通pooled行AUC、预测损失、报警延迟都不能直接替代该指标。我们用完整在线时刻评价，并以独立sklearn实现交叉核对关键结果。</p>
+<h2 id="section-3">2. 以每条序列自己的历史建立正常参照</h2>
+<p>同一数值、方差或自相关水平，对不同生成过程的含义可能完全不同。我们的第一步不是设全局异常阈值，而是问：当前前缀与<strong>这条序列自身历史</strong>相比，出现了怎样的变化？</p>
+<h3>2.1 三条残差流</h3>
+<p>主表示在历史上拟合带截距的AR模型，BIC选择阶数，上限12；在线保持拟合系数和历史创新尺度不变，只更新已经见到的滞后值。</p>
+<p>由新点的AR创新e得到：</p>
+<ul>
+<li><strong>z</strong>：创新除以历史创新尺度；</li>
+<li><strong>n</strong>：创新经历史经验分布的PIT，再转为标准正态分位；</li>
+<li><strong>g</strong>：在创新标准化基础上，再除以因果EWMA条件尺度；平滑参数由历史选择。</li>
+</ul>
+<p>只有n明确做了normal-score变换。z和g的尺度标准化<strong>不保证正态、独立或零假设下完美校准</strong>。</p>
+<p>另一条表示使用更长阶的AR候选，并按AICc权重混合系数，而不是单独选择一个长阶数。它供longAR树组使用。该组推理必须使用对应特征，不能误用BIC矩阵。</p>
+<h3>2.2 多通道、多窗口的证据</h3>
+<p>三条流上共26个通道，覆盖水平、平方、绝对值、符号、尾指示、最高lag8的滞后乘积和ARCH式依赖。每个通道比较近期窗口均值与历史通道均值，并按历史标准差及当前有效窗口长度的平方根缩放。</p>
+<p>有限窗口为：</p>
+<pre><code class="language-text">5, 7, 10, 14, 20, 28, 40, 57, 80, 113, 160, 226, 320, 453, 640
+</code></pre>
+<p>另加“从在线开始至今”的第16个窗口。每个通道再计算峰值、峰值尺度、双向CUSUM和跨尺度的Bayes-inspired汇总；加上历史过程描述、当前t/log t，以及180列派生交互，总计 <strong>763列</strong>：</p>
+<pre><code class="language-text">26 * (16个窗口 + 6个汇总) + 9个历史context + t/log t + 180 = 763
+</code></pre>
+<p>这些是z-style变化证据，不是校准后的检验p值。目标是让学习器组合多种不完美的观察，而不是宣称某一个手写统计量足够。</p>
+<h2 id="section-4">3. 树集成：改变训练任务，而不只是增加种子</h2>
+<p>主体是四组LightGBM，每组三种子：</p>
+<div class="table-scroll" role="region" tabindex="0" aria-label="可横向滚动的表格"><table>
+<thead>
+<tr>
+  <th>组</th>
+  <th>主要区别</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>sim4</td>
+  <td>加入模拟断点样本</td>
+</tr>
+<tr>
+  <td>shift</td>
+  <td>将正例历史尾部移入在线段，得到更早的监测起点</td>
+</tr>
+<tr>
+  <td>advance</td>
+  <td>将部分断前在线前缀移入定长历史，并相应移动剩余断点位置</td>
+</tr>
+<tr>
+  <td>longAR</td>
+  <td>使用AICc加权长阶AR白化</td>
+</tr>
+</tbody>
+</table></div>
+<p>每组都保留真实训练时刻。主要多样性来自训练分布和表示，而不只是同一数据的不同随机种子。</p>
+<h3>3.1 全时刻覆盖，但控制真实行总损失质量</h3>
+<p>一次有效改变是将稀疏抽样改成使用全部真实在线时刻。但若直接全部赋权1，真实与增强来源的比例也会同时改变。我们给真实行权重约 <strong>0.14994</strong>，普通增强行权重1，从而保留原稀疏策略对应的总损失质量。三供体移植行各给1/3，避免把该增强的质量放大三倍。</p>
+<p>这样把“提高覆盖”与“改变来源权重”区分开。它控制的是来源相对损失质量，并不消除序列内相关性；验证仍须按父序列分组。</p>
+<p>主树采用较保守的参数，例如学习率0.02、31叶、大最小叶支持和L2正则。大多数模型400轮；sim4的两个种子延长到1,200轮，第三个保留400轮。</p>
+<h3>3.2 真实变化移植侧模型</h3>
+<p>shift和longAR各有三个移植侧booster，共6个，最终为1,200轮。它们使用真实断后供体材料移植到其他序列的增强，不完全依赖参数化断点。</p>
+<p>推理时，受影响组先做 <strong>25%原组＋75%移植侧组</strong>；再将四个组等权平均。放置方式很重要：增强模型单独更强，或同时改造多个组，不一定让集成更好，反而可能减少错误多样性。</p>
+<p>交叉验证中，增强和供体构建必须跟随外折训练父序列，不能先对全数据生成增强再切折。</p>
+<h2 id="section-5">4. 神经成员：同样的信息，不同的函数与累计方式</h2>
+<p>神经模型输入为历史标准化raw值和z/n/g流，使用因果patch表示和运行统计。不是外部预训练时序大模型。</p>
+<h3>4.1 因果patch-TCN</h3>
+<p>TCN结合当前未完成patch、历史/过去在线patch表示以及显式运行统计。当前patch的表示必须遮掉尚未到来的点。</p>
+<p>终版平均两个种子。训练包含真实数据、advance增强、历史patch抽样、符号反射，以及随机在线锚点上的配对质量加权logistic损失。标准训练60轮，AdamW并配合warm-up/cosine学习率。</p>
+<p>它的价值在于互补，而不是一定要单体强于树。历史对照中，advance训练把其与树基座的pooled OOF logit相关从约0.920降到0.854。</p>
+<h3>4.2 神经证据累积</h3>
+<p>另一成员学习逐点证据增量，在log域执行：</p>
+<pre><code class="language-text">r_t = softplus(r_(t-1)) + increment_t
+score_t = sigmoid(r_t + bias + training_time_prior_t)
+</code></pre>
+<p>初始条件为 <code>R_0=0</code>，等价于 <code>r_0=−∞</code>，因此首步是 <code>r_1=increment_1</code>。</p>
+<p>在最终读出之前，这等价于Shiryaev–Roberts形式：</p>
+<pre><code class="language-text">R_t = (1 + R_(t-1)) * exp(increment_t)
+</code></pre>
+<p>该形式汇总可能起点的证据，但增量是判别式学习的，<strong>不宣称是真实、已校准的log-likelihood ratio</strong>，更不宣称最终集成是精确贝叶斯后验。</p>
+<p>终版CUSUM-style成员平均8个种子，使用real、advance×2及shift。与双种子TCN按时间斜坡交接：</p>
+<pre><code class="language-text">alpha_t = clip((t - 32) / 96, 0, 1)
+Neural_t = (1-alpha_t)*TCN2_t + alpha_t*CUSUM8_t
+Base_t = 0.70*Tree_t + 0.30*Neural_t
+</code></pre>
+<p>前32点以TCN为主，第128点起完全使用累计成员。</p>
+<h2 id="section-6">5. 终版53模型不是简单平均</h2>
+<div class="table-scroll" role="region" tabindex="0" aria-label="可横向滚动的表格"><table>
+<thead>
+<tr>
+  <th>组件</th>
+  <th style="text-align:right">拟合模型数</th>
+  <th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>四组主树</td>
+  <td style="text-align:right">12</td>
+  <td>多尺度主判据</td>
+</tr>
+<tr>
+  <td>移植侧树</td>
+  <td style="text-align:right">6</td>
+  <td>组内混合</td>
+</tr>
+<tr>
+  <td>TCN</td>
+  <td style="text-align:right">2</td>
+  <td>早期神经证据</td>
+</tr>
+<tr>
+  <td>神经CUSUM</td>
+  <td style="text-align:right">8</td>
+  <td>时间累积</td>
+</tr>
+<tr>
+  <td>Reset</td>
+  <td style="text-align:right">2</td>
+  <td>互补概率混合</td>
+</tr>
+<tr>
+  <td>Prefix</td>
+  <td style="text-align:right">1</td>
+  <td>按历史路由的差分修正</td>
+</tr>
+<tr>
+  <td>Paired comparator</td>
+  <td style="text-align:right">2</td>
+  <td>两段比较混合</td>
+</tr>
+<tr>
+  <td>Signature / moments</td>
+  <td style="text-align:right">4</td>
+  <td>匹配预测差分</td>
+</tr>
+<tr>
+  <td>Direction及其先验</td>
+  <td style="text-align:right">16</td>
+  <td>历史条件方向差分</td>
+</tr>
+<tr>
+  <td><strong>合计</strong></td>
+  <td style="text-align:right"><strong>53</strong></td>
+  <td><strong>38个树booster＋15个神经模型</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p>Reset在每点将GRU隐藏态重置为历史导出的初态，但保留运行统计和SR，因此不能称作“完全没有时间信息”。</p>
+<p>Prefix读取完整已见前缀并采用年龄格点读出，不是对每个起点分别读取后缀。它相对Reset937加差分，257–512步使用更高权重。历史量 <code>abs(log(sigma_AR/std(H)))</code> 低于0.0137378481时路由倍率为1.5，否则0.5。</p>
+<p>Comparator增加两段比较视角。Signature加入的是其预测减去匹配moments模型预测，不等于签名单体普遍优于矩。Direction用历史预测变化方向，加入相对匹配基础模型的差分。</p>
+<p>完整分层顺序为：</p>
+<pre><code class="language-text">B = 0.70*Tree + 0.30*Neural
+U = clip(0.90*B + 0.10*Reset2
+         + route(H)*w_t*(Prefix - Reset937))
+V = clip(0.95*U + 0.05*Comparator2
+         + 0.05*(Signature2 - Moments2))
+S = clip(V + 0.1108333333*mean(Direction - MatchedBase))
+</code></pre>
+<p>clip范围[0,1]；signature差分从第32步启用；w_t在257–512步为0.15，其余0.05。裁剪发生在prefix、comparator/signature和direction三个阶段后，而不是每项操作后分别裁剪。</p>
+<p>列清这些组件是为解释真实提交，并不意味着每项都有同样强的独立效果证据。很多后期修正很小，又经过重复研发选型，解释时必须保守。</p>
+<h2 id="section-7">6. 结果：公榜、私榜、本地不能混用</h2>
+<h3>6.1 最终选中提交</h3>
+<div class="table-scroll" role="region" tabindex="0" aria-label="可横向滚动的表格"><table>
+<thead>
+<tr>
+  <th>评价</th>
+  <th style="text-align:right">数值</th>
+  <th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>终版公榜</td>
+  <td style="text-align:right"><strong>65.34%</strong></td>
+  <td>含公开标签训练的样本内成分</td>
+</tr>
+<tr>
+  <td>终版私榜</td>
+  <td style="text-align:right"><strong>65.2271%</strong></td>
+  <td>官方最终样本外结果</td>
+</tr>
+<tr>
+  <td>官方排名</td>
+  <td style="text-align:right"><strong>39</strong></td>
+  <td>按团队去重的排名</td>
+</tr>
+</tbody>
+</table></div>
+<p>公私榜相差约−0.11pp，但测试总体不同，不能全部归因于公开100条，也不能据此量化其私榜影响。</p>
+<h3>6.2 公榜开发里程碑</h3>
+<p>这些不是统一协议的严格消融，不能直接将相邻差值或组件增益相加。</p>
+<div class="table-scroll" role="region" tabindex="0" aria-label="可横向滚动的表格"><table>
+<thead>
+<tr>
+  <th>提交</th>
+  <th>达到的主要阶段</th>
+  <th style="text-align:right">公榜</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>#1</td>
+  <td>历史校准残差统计＋LightGBM</td>
+  <td style="text-align:right">63.00%</td>
+</tr>
+<tr>
+  <td>#2</td>
+  <td>更细窗口、交互及种子平均</td>
+  <td style="text-align:right">63.48%</td>
+</tr>
+<tr>
+  <td>#9</td>
+  <td>全真实时刻覆盖、控制loss质量</td>
+  <td style="text-align:right">63.99%</td>
+</tr>
+<tr>
+  <td>#11</td>
+  <td>TCN与advance训练</td>
+  <td style="text-align:right">64.53%</td>
+</tr>
+<tr>
+  <td>#13</td>
+  <td>神经累计、调整核心组合</td>
+  <td style="text-align:right">64.66%</td>
+</tr>
+<tr>
+  <td>#17</td>
+  <td>Reset/prefix及移植侧模型</td>
+  <td style="text-align:right">65.01%</td>
+</tr>
+<tr>
+  <td>#25</td>
+  <td>后期修正、更多CUSUM种子和长侧树</td>
+  <td style="text-align:right">65.23%</td>
+</tr>
+<tr>
+  <td>#30</td>
+  <td>沿用#28公开100条重训权重；修复训练编排</td>
+  <td style="text-align:right">65.34%</td>
+</tr>
+</tbody>
+</table></div>
+<p>早期官方EWMA基线在给定训练总体上约51.45%，不含学习参数。这是本地读数，不能与第一个模型的63.00%公榜直接相减当作严格公榜增益。</p>
+<h2 id="section-8">7. 公开标签与数据使用披露</h2>
+<p>官方提供的100条带标签reduced-test属于公榜，不属于私榜。三棵advance树此前已将它们作为普通训练样本；终版重训又将这些序列加入其他模型族：50个拟合模型文件重新训练，三棵advance沿用，历史路由阈值按合并父序列重算。</p>
+<p>这会引入样本内公榜收益。其对完整公榜的贡献没有被隔离，因此不计作泛化证据。</p>
+<p>研究期间还单独做过#16公开标签查表探测，公榜约65.70%。<strong>它没有被选作终版，也不是本文描述的最终模型。</strong> 终版使用公开序列参与训练，不在推理时按序列身份查表返回标签。</p>
+<p>最终重建配方的训练输入来自官方训练数据与官方已公开的reduced-test，不包含隐藏测试序列或外部预训练时序权重。修复包未打包比赛数据。</p>
+<p>我们没有添加显式浮点网格伪迹检测器或伪迹专用决策规则。这不意味着任何学习模型都天然不受数据伪迹影响，也不代表已经量化伪迹对最终排名的作用。</p>
+<h2 id="section-9">8. 有效经验、负结果与反思</h2>
+<p><strong>先校准是基础。</strong> 用各序列自身历史建立参照，比一个全局异常阈值更适合异质过程；多尺度表示承载了主要证据。</p>
+<p><strong>训练分布和模型家族同样重要。</strong> 移动起点、模拟断点和真实变化移植会改变错误结构。增强更多、单模型更强，不等于集成更好。</p>
+<p><strong>互补性必须在完整配方里测。</strong> TCN、累积成员、Reset可以在单体不占优时提供增益；但低相关本身不够，弱成员仍然可能有害。</p>
+<p><strong>正常预测质量不等于检测能力。</strong> 一个受控正常密度实验的留出NLL改善约0.019–0.023 nat，但固定窗口NLL分数没有产生新增断点信息。它只能否定那种构造，不能否定学习式似然检测整个方向。</p>
+<p><strong>后期小修正的实践收益递减。</strong> 我们测试过的更大/其他序列网络、外部时序预训练、蒸馏、学习型stacking、新统计特征、专家路由等，许多没能稳定提升当时的完整集成。这不是对这些模型家族的一般否定。</p>
+<p>重来一次，我们会更早建立经过校验的概率式基线，把OOF预测与临时缓存分开长期保留，并减少在缺少干净确认之前堆叠小修正。研究使用了AI辅助实现与实验编排；其加速作用不能替代独立评分、协议冻结和对结论边界的人工判断。</p>
+<h2 id="section-10">9. 工程、因果性与可复现边界</h2>
+<p>预训练推理使用CPU上的NumPy、SciPy和LightGBM，签名可选C++加速，另有NumPy回退；PyTorch用于训练，不是最终预训练推理依赖。每条序列独立维护状态，不使用跨测试序列适配或批量t内秩归一化。</p>
+<p>选中的云端CPU运行约 <strong>2小时31分</strong>。官方本地确定性检查在<strong>预训练权重路径</strong>通过 <strong>1e−8</strong> 容差，并做过原始输入回放、前缀与顺序检查。这不等于跨硬件、跨库版本重训逐字节一致。</p>
+<p>#30的拟合权重、ensemble配置和推理源码与#28相同。修复的是训练编排、输入解析和provenance，并移除包内比赛数据。原始输入低预算smoke覆盖了全部模型族；但工程修复后<strong>没有重新完整跑一次全预算、10,100父、53模型的从零训练</strong>。这与已有权重推理不变是两个不同的验证命题。</p>
+<p>本文不再分发比赛数据，也不声称源代码或权重已经公开。</p>
+<h2 id="section-11">结语</h2>
+<p>有价值的抽象是“经过历史校准的变化证据”，而不是一个万能异常分数。历史建模、多尺度、训练分布多样性和学习式累积共同形成了因果检测器，最终私榜65.2271%，第39名。</p>
+<p>研究流程中更容易出错的是对进展的解释：公榜涨分、本地组件增益和完整集成泛化表现经常被混在一起。write-up应像代码保持因果性一样，保持这些证据口径的边界。</p>
+<h2 id="section-12">参考资料</h2>
+<ul>
+<li><a href="https://docs.crunchdao.com/competitions/competitions/structural-break-real-time">本届任务与评价文档</a></li>
+<li><a href="https://hub.crunchdao.com/competitions/structural-break-real-time/leaderboard?crunchId=458">官方样本外榜单</a></li>
+<li><a href="https://www.adialab.ae/adia-lab-x-crunch-the-structural-break-challenge-2026">ADIA Lab比赛页</a></li>
+<li><a href="https://docs.crunchdao.com/competitions/competitions#write-up">CrunchDAO write-up说明</a></li>
+</ul>
+</article>
+</main></div>
+<footer class="site-footer"><span>cybergeek · Independent developer and researcher</span>
+<span>ADIA Lab Structural Break Challenge · Real-Time Edition</span></footer>
+</body></html>
